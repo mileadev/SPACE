@@ -1,0 +1,34 @@
+name: Fork MCP integration CI
+
+on:
+  push:
+    branches: [main, 'feat/**']
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  mcp-bridge:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Compile and unit-test bridge (stdlib only)
+        run: |
+          python3 -m compileall -q integrations/space-mcp
+          python3 -m unittest discover -s integrations/space-mcp -p 'test_*.py' -v
+      - name: Verify SDK dependencies and MCP registration
+        run: |
+          python3 -m venv /tmp/space-mcp-venv
+          /tmp/space-mcp-venv/bin/python -m pip install -r integrations/space-mcp/requirements.txt
+          /tmp/space-mcp-venv/bin/python - <<'PY'
+          import sys
+          sys.path.insert(0, 'integrations/space-mcp')
+          from server import build_server
+          import asyncio
+          names = {item.name for item in asyncio.run(build_server().list_tools())}
+          assert names == {'space_list', 'space_create', 'space_status', 'space_operation', 'space_run', 'space_delete', 'model_chat'}, names
+          PY
