@@ -52,6 +52,10 @@ use crate::sandbox_quarantine_store;
 
 use super::{optional_trimmed, parse_sandbox_id, proto_network_policy_to_common, trimmed_required};
 
+#[path = "published_state/input.rs"]
+mod input;
+use input::PublishedSandboxRow;
+
 const NODE_RECONCILE_QUEUE_FIRST_SEEN_ON_CONFLICT: &str = "
 ON CONFLICT (node_id, facet, element) DO UPDATE
 SET generation = node_reconcile_queue.generation + 1,
@@ -247,102 +251,6 @@ fn parse_published_transition_receipt(
         message: error.to_string(),
     })?;
     Ok(Some(receipt))
-}
-
-struct ObservedStateComparableColumn {
-    stored: &'static str,
-    incoming: &'static str,
-    excluded: &'static str,
-}
-
-const OBSERVED_STATE_COMPARABLE_COLUMNS: &[ObservedStateComparableColumn] = &[
-    ObservedStateComparableColumn {
-        stored: "node_id",
-        incoming: "$1",
-        excluded: "{source}.node_id",
-    },
-    observed_state_column("status"),
-    observed_state_column("runtime"),
-    observed_state_column("spaced_version"),
-    observed_state_column("runtime_version"),
-    observed_state_column("guest_os"),
-    observed_state_column("guest_arch"),
-    observed_state_column("state_format_name"),
-    observed_state_column("state_format_version"),
-    observed_state_column("execution_metadata"),
-    observed_state_column("pid"),
-    observed_state_column("namespace"),
-    observed_state_column("uptime"),
-    observed_state_column("sandbox_owner"),
-    observed_state_column("sandbox_user"),
-    observed_state_column("image_hash"),
-    ObservedStateComparableColumn {
-        stored: "snapshots_enabled",
-        incoming: "COALESCE({source}.snapshots_enabled, FALSE)",
-        excluded: "{source}.snapshots_enabled",
-    },
-    observed_state_column("template"),
-    observed_state_column("pool_template"),
-    observed_state_column("failure_reason"),
-    observed_state_column("observed_created_at"),
-    observed_state_column("network_tx_bytes"),
-    observed_state_column("network_rx_bytes"),
-    ObservedStateComparableColumn {
-        stored: "disk_usage_bytes",
-        incoming: "COALESCE({source}.disk_usage_bytes, observed_current.disk_usage_bytes)",
-        excluded: "COALESCE({source}.disk_usage_bytes, sandbox_observed_states.disk_usage_bytes)",
-    },
-    observed_state_column("auto_lifecycle_authority"),
-    ObservedStateComparableColumn {
-        stored: "missing_publish_count",
-        incoming: "0",
-        excluded: "0",
-    },
-];
-
-const fn observed_state_column(column: &'static str) -> ObservedStateComparableColumn {
-    ObservedStateComparableColumn {
-        stored: column,
-        incoming: "{source}.{column}",
-        excluded: "{source}.{column}",
-    }
-}
-
-fn observed_state_stored_tuple(source: &str) -> String {
-    observed_state_tuple(
-        OBSERVED_STATE_COMPARABLE_COLUMNS
-            .iter()
-            .map(|column| format!("{source}.{}", column.stored)),
-    )
-}
-
-fn observed_state_incoming_tuple(source: &str) -> String {
-    observed_state_tuple(
-        OBSERVED_STATE_COMPARABLE_COLUMNS
-            .iter()
-            .map(|column| render_observed_state_expression(column.incoming, source, column.stored)),
-    )
-}
-
-fn observed_state_excluded_tuple() -> String {
-    observed_state_tuple(
-        OBSERVED_STATE_COMPARABLE_COLUMNS.iter().map(|column| {
-            render_observed_state_expression(column.excluded, "EXCLUDED", column.stored)
-        }),
-    )
-}
-
-fn observed_state_tuple(expressions: impl Iterator<Item = String>) -> String {
-    format!(
-        "({})",
-        expressions.collect::<Vec<_>>().join(",\n                 ")
-    )
-}
-
-fn render_observed_state_expression(template: &str, source: &str, column: &str) -> String {
-    template
-        .replace("{source}", source)
-        .replace("{column}", column)
 }
 
 pub(crate) struct ExecutionProjection {
@@ -1595,15 +1503,35 @@ static DELETE_ABSENT_STOPPED_SANDBOXES: LazyLock<String> = LazyLock::new(|| {
     )
 });
 
+/// [`publish_sandbox_states_with_retirement`] with abandoned-restore
+/// retirement disabled, the setting every replica runs until it's turned on.
+pub async fn publish_sandbox_states(
+    conn: &mut sqlx::PgConnection,
+    node_id: NodeId,
+    states: &[PublishedSandboxState],
+) -> Result<SandboxPublicationOutcome, Status> {
+    publish_sandbox_states_with_retirement(
+        conn,
+        node_id,
+        states,
+        pplx_space_common_core::types::AbandonedRestoreRetirement::Disabled,
+    )
+    .await
+}
+
 /// Publishes a node's sandbox observations.
 ///
 /// Callers that need atomic lifecycle convergence should run this inside a
 /// transaction. Node-published suspended projection uses multiple statements
 /// over one locked candidate set and relies on transaction rollback on error.
-pub async fn publish_sandbox_states(
+/// `retirement` decides whether a rollback receipt for a restore may retire
+/// its execution as `replaced` (see
+/// `sandbox_quarantine_store::apply_activation_rollback_candidates`).
+pub async fn publish_sandbox_states_with_retirement(
     conn: &mut sqlx::PgConnection,
     node_id: NodeId,
     states: &[PublishedSandboxState],
+    retirement: pplx_space_common_core::types::AbandonedRestoreRetirement,
 ) -> Result<SandboxPublicationOutcome, Status> {
     let mut states_by_id = BTreeMap::new();
     for state in states {
@@ -1837,143 +1765,134 @@ pub async fn publish_sandbox_states(
                 .map(PodUid::parse)
                 .transpose()
                 .map_err(|error| Status::invalid_argument(error.to_string()))?;
-            let mut row = serde_json::json!({
-                "sandbox_id": sandbox_uuid,
-                "status": optional_trimmed(state.status.as_deref()),
-                "template": optional_trimmed(state.template.as_deref()),
-                "runtime": optional_trimmed(state.runtime.as_deref())
-                    .or_else(|| execution.as_ref().map(|execution| execution.runtime.clone())),
-                "spaced_version": spaced_version.as_ref().map(ToString::to_string),
-                "runtime_version": execution.as_ref().map(|execution| execution.runtime_version.clone()),
-                "guest_os": execution.as_ref().map(|execution| execution.guest_os.clone()),
-                "guest_arch": execution.as_ref().map(|execution| execution.guest_arch.clone()),
-                "state_format_name": execution.as_ref().and_then(|execution| execution.state_format_name.clone()),
-                "state_format_version": execution.as_ref().and_then(|execution| execution.state_format_version.clone()),
-                "execution_metadata": execution.as_ref().map(|execution| execution.metadata.clone()),
-                "execution_components": execution.as_ref().map(|execution| execution.components.clone()).unwrap_or_default(),
-                "pid": state.pid.map(|value| u32_to_i32(value, "pid")).transpose()?,
-                "namespace": optional_trimmed(state.namespace.as_deref()),
-                "uptime": optional_trimmed(state.uptime.as_deref()),
-                "sandbox_owner": optional_trimmed(state.owner.as_deref()),
-                "sandbox_user": optional_trimmed(state.owner.as_deref()),
-                "image_hash": optional_trimmed(state.content_hash.as_deref()),
-                "snapshots_enabled": state.snapshots_enabled,
-                "pool_template": optional_trimmed(state.pool_template.as_deref()),
-                "failure_reason": optional_trimmed(state.failure_reason.as_deref()),
-                "observed_created_at": optional_trimmed(state.created_at.as_deref()),
-                "last_used_at": state.last_used_at.as_ref()
+            let row = PublishedSandboxRow {
+                sandbox_id: sandbox_uuid,
+                status: optional_trimmed(state.status.as_deref()),
+                template: optional_trimmed(state.template.as_deref()),
+                runtime: optional_trimmed(state.runtime.as_deref()).or_else(|| {
+                    execution
+                        .as_ref()
+                        .map(|execution| execution.runtime.clone())
+                }),
+                spaced_version: spaced_version.as_ref().map(ToString::to_string),
+                runtime_version: execution
+                    .as_ref()
+                    .map(|execution| execution.runtime_version.clone()),
+                guest_os: execution
+                    .as_ref()
+                    .map(|execution| execution.guest_os.clone()),
+                guest_arch: execution
+                    .as_ref()
+                    .map(|execution| execution.guest_arch.clone()),
+                state_format_name: execution
+                    .as_ref()
+                    .and_then(|execution| execution.state_format_name.clone()),
+                state_format_version: execution
+                    .as_ref()
+                    .and_then(|execution| execution.state_format_version.clone()),
+                execution_metadata: execution
+                    .as_ref()
+                    .map(|execution| execution.metadata.clone()),
+                execution_components: execution
+                    .as_ref()
+                    .map(|execution| execution.components.clone())
+                    .unwrap_or_default(),
+                pid: state
+                    .pid
+                    .map(|value| u32_to_i32(value, "pid"))
+                    .transpose()?,
+                namespace: optional_trimmed(state.namespace.as_deref()),
+                uptime: optional_trimmed(state.uptime.as_deref()),
+                sandbox_owner: optional_trimmed(state.owner.as_deref()),
+                sandbox_user: optional_trimmed(state.owner.as_deref()),
+                image_hash: optional_trimmed(state.content_hash.as_deref()),
+                snapshots_enabled: state.snapshots_enabled,
+                pool_template: optional_trimmed(state.pool_template.as_deref()),
+                failure_reason: optional_trimmed(state.failure_reason.as_deref()),
+                observed_created_at: optional_trimmed(state.created_at.as_deref()),
+                last_used_at: state
+                    .last_used_at
+                    .as_ref()
                     .map(|timestamp| proto_timestamp_to_rfc3339(timestamp, "last_used_at"))
                     .transpose()?,
-                "last_access_at": state.last_access_at.as_ref()
+                last_access_at: state
+                    .last_access_at
+                    .as_ref()
                     .map(|timestamp| proto_timestamp_to_rfc3339(timestamp, "last_access_at"))
                     .transpose()?,
-                "last_command_at": state.last_command_at.as_ref()
+                last_command_at: state
+                    .last_command_at
+                    .as_ref()
                     .map(|timestamp| proto_timestamp_to_rfc3339(timestamp, "last_command_at"))
                     .transpose()?,
-                "network_tx_bytes": state.network_tx_bytes
+                network_tx_bytes: state
+                    .network_tx_bytes
                     .map(|value| u64_to_i64(value, "network_tx_bytes"))
                     .transpose()?,
-                "network_rx_bytes": state.network_rx_bytes
+                network_rx_bytes: state
+                    .network_rx_bytes
                     .map(|value| u64_to_i64(value, "network_rx_bytes"))
                     .transpose()?,
-                "disk_usage_bytes": state.disk_usage_bytes
+                disk_usage_bytes: state
+                    .disk_usage_bytes
                     .map(|value| u64_to_i64(value, "disk_usage_bytes"))
                     .transpose()?,
-                "observed_network_policy_json": observed_network_policy,
-                "observed_network_policy_generation": observed_network_policy_generation,
-                "observed_network_policy_source": network_policy_source_str(
+                observed_network_policy_json: observed_network_policy,
+                observed_network_policy_generation,
+                observed_network_policy_source: network_policy_source_str(
                     state.observed_network_policy_source,
                 ),
-                "observed_network_policy_authority": PolicyAuthority::from_optional_proto(
+                observed_network_policy_authority: PolicyAuthority::from_optional_proto(
                     state.observed_network_policy_authority,
                 )
                 .map(|authority| authority.map(|authority| authority.as_str()))
                 .map_err(|error| Status::invalid_argument(error.to_string()))?,
-                "auto_lifecycle_authority": PolicyAuthority::from_optional_proto(
+                auto_lifecycle_authority: PolicyAuthority::from_optional_proto(
                     state.auto_lifecycle_authority,
                 )
                 .map(|authority| authority.map(|authority| authority.as_str()))
                 .map_err(|error| Status::invalid_argument(error.to_string()))?,
-                "quarantine_reason_code": optional_trimmed(state.quarantine_reason_code.as_deref()),
-                "transition_receipt_id": transition_receipt.map(|receipt| receipt.id().as_uuid()),
-                "transition_receipt_kind": transition_receipt.map(|receipt| receipt.kind().as_str()),
-                "transition_receipt_target_state": transition_receipt.map(|receipt| receipt.target_state().as_str()),
-                "transition_receipt_execution_generation": transition_receipt
+                quarantine_reason_code: optional_trimmed(state.quarantine_reason_code.as_deref()),
+                transition_receipt_id: transition_receipt.map(|receipt| receipt.id().as_uuid()),
+                transition_receipt_kind: transition_receipt.map(|receipt| receipt.kind().as_str()),
+                transition_receipt_target_state: transition_receipt
+                    .map(|receipt| receipt.target_state().as_str()),
+                transition_receipt_execution_generation: transition_receipt
                     .map(|receipt| receipt.execution_generation().get()),
-                "transition_receipt_reason_code": transition_receipt
+                transition_receipt_reason_code: transition_receipt
                     .and_then(|receipt| receipt.reason_code().map(|reason| reason.as_str())),
-                "transition_receipt_activation_attempt_id": transition_receipt
+                transition_receipt_activation_attempt_id: transition_receipt
                     .and_then(|receipt| receipt.activation_attempt_id().map(|id| id.as_uuid())),
-            });
-            let row_fields = row.as_object_mut().ok_or_else(|| {
-                Status::internal("published sandbox state did not serialize as an object")
-            })?;
-            let quarantine_recovery_payload = quarantine_recovery.as_ref().map(|observation| {
-                serde_json::json!({
-                    "schema_version": observation.schema_version,
-                    "local_quarantine_id": observation.local_quarantine_id,
-                    "observed_owner": observation.observed_owner_name(),
-                    "attempt_count": observation.attempt_count,
-                    "next_attempt_at": observation.next_attempt_at.as_deref(),
-                })
-            });
-            row_fields.insert(
-                "quarantine_recovery_payload".to_string(),
-                quarantine_recovery_payload.unwrap_or(serde_json::Value::Null),
-            );
-            row_fields.insert(
-                "quarantine_recovery_observation_degraded".to_string(),
-                serde_json::Value::Bool(quarantine_recovery_degraded),
-            );
-            row_fields.insert(
-                "transition_receipt_recovery_policy".to_string(),
-                transition_receipt
+
+                quarantine_recovery_payload: quarantine_recovery.as_ref().map(|observation| {
+                    serde_json::json!({
+                        "schema_version": observation.schema_version,
+                        "local_quarantine_id": observation.local_quarantine_id,
+                        "observed_owner": observation.observed_owner_name(),
+                        "attempt_count": observation.attempt_count,
+                        "next_attempt_at": observation.next_attempt_at.as_deref(),
+                    })
+                }),
+                quarantine_recovery_observation_degraded: quarantine_recovery_degraded,
+                transition_receipt_recovery_policy: transition_receipt
                     .and_then(|receipt| receipt.reason_code().copied())
                     .and_then(|reason| reason.automatic_recovery_policy())
-                    .map(|policy| serde_json::Value::String(policy.to_string()))
-                    .unwrap_or(serde_json::Value::Null),
-            );
-            row_fields.insert(
-                "current_local_artifact_id".to_string(),
-                current_local_artifact
-                    .map(|(id, _, _)| serde_json::Value::String(id.to_string()))
-                    .unwrap_or(serde_json::Value::Null),
-            );
-            row_fields.insert(
-                "current_local_artifact_kind".to_string(),
-                current_local_artifact
-                    .map(|(_, kind, _)| serde_json::Value::String(kind.to_string()))
-                    .unwrap_or(serde_json::Value::Null),
-            );
-            row_fields.insert(
-                "current_local_artifact_origin".to_string(),
-                current_local_artifact
-                    .map(|(_, _, origin)| serde_json::Value::String(origin.to_string()))
-                    .unwrap_or(serde_json::Value::Null),
-            );
-            row_fields.insert(
-                "state_changed_at".to_string(),
-                match state_changed_at {
-                    Some(changed_at) => {
-                        serde_json::Value::String(changed_at.format(&Rfc3339).map_err(|error| {
+                    .map(|policy| policy.to_string()),
+                current_local_artifact_id: current_local_artifact.map(|(id, _, _)| id.to_string()),
+                current_local_artifact_kind: current_local_artifact
+                    .map(|(_, kind, _)| kind.to_string()),
+                current_local_artifact_origin: current_local_artifact
+                    .map(|(_, _, origin)| origin.to_string()),
+                state_changed_at: state_changed_at
+                    .map(|changed_at| {
+                        changed_at.format(&Rfc3339).map_err(|error| {
                             Status::internal(format!("format state_changed_at: {error}"))
-                        })?)
-                    }
-                    None => serde_json::Value::Null,
-                },
-            );
-            row_fields.insert(
-                "execution_generation".to_string(),
-                execution_generation
-                    .map(|generation| serde_json::Value::from(generation.get()))
-                    .unwrap_or(serde_json::Value::Null),
-            );
-            row_fields.insert(
-                "pod_uid".to_string(),
-                pod_uid
-                    .map(|pod_uid| serde_json::Value::String(pod_uid.to_string()))
-                    .unwrap_or(serde_json::Value::Null),
-            );
+                        })
+                    })
+                    .transpose()?,
+                execution_generation: execution_generation.map(|generation| generation.get()),
+                pod_uid: pod_uid.map(|pod_uid| pod_uid.to_string()),
+            };
             rows.push(row);
             for snapshot in &state.snapshots {
                 snapshot_rows.push(snapshot_json(sandbox_uuid, snapshot)?);
@@ -2258,191 +2177,10 @@ pub async fn publish_sandbox_states(
         });
     }
 
-    let observed_state_write_sql = format!(
-        "WITH input AS (
-             SELECT *
-             FROM jsonb_to_recordset($2::jsonb) AS input(
-                 sandbox_id UUID,
-                 status TEXT,
-                 state_changed_at TIMESTAMPTZ,
-                 template TEXT,
-                 runtime TEXT,
-                 spaced_version TEXT,
-                 runtime_version TEXT,
-                 guest_os TEXT,
-                 guest_arch TEXT,
-                 state_format_name TEXT,
-                 state_format_version TEXT,
-                 execution_metadata JSONB,
-                 execution_components JSONB,
-                 pid INTEGER,
-                 namespace TEXT,
-                 uptime TEXT,
-                 sandbox_owner TEXT,
-                 sandbox_user TEXT,
-                 image_hash TEXT,
-                 snapshots_enabled BOOLEAN,
-                 pool_template TEXT,
-                 failure_reason TEXT,
-                 observed_created_at TEXT,
-                 network_tx_bytes BIGINT,
-                 network_rx_bytes BIGINT,
-                 disk_usage_bytes BIGINT,
-                 observed_network_policy_json JSONB,
-                 observed_network_policy_generation BIGINT,
-                 observed_network_policy_source TEXT,
-                 observed_network_policy_authority TEXT,
-                 auto_lifecycle_authority TEXT
-             )
-         ),
-         publishable AS (
-             SELECT input.*,
-                    s.id IS NOT NULL AS assigned_to_node
-             FROM input
-             LEFT JOIN sandboxes s ON s.id = input.sandbox_id
-             LEFT JOIN sandbox_direct_route_identities direct_route
-               ON direct_route.sandbox_id = s.id
-             WHERE s.id IS NULL
-                OR COALESCE(direct_route.current_node_id, s.active_node_id) = $1
-         ),
-         observed_current AS MATERIALIZED (
-             SELECT sos.*
-             FROM sandbox_observed_states sos
-             JOIN publishable ON publishable.sandbox_id = sos.sandbox_id
-         ),
-         existing AS (
-             SELECT DISTINCT sandbox_id
-             FROM observed_current
-             WHERE node_id = $1
-         ),
-         changed_or_missing AS MATERIALIZED (
-             SELECT publishable.*
-             FROM publishable
-             LEFT JOIN observed_current ON observed_current.sandbox_id = publishable.sandbox_id
-             WHERE observed_current.sandbox_id IS NULL
-                OR {prefilter_current} IS DISTINCT FROM {prefilter_incoming}
-         ),
-         upserted AS (
-             INSERT INTO sandbox_observed_states (
-                 sandbox_id, node_id, status, runtime, spaced_version, runtime_version, guest_os, guest_arch,
-                 state_format_name, state_format_version, execution_metadata, pid, namespace, uptime,
-                 sandbox_owner, sandbox_user, image_hash,
-                 snapshots_enabled, template, pool_template, failure_reason,
-                 observed_created_at, network_tx_bytes, network_rx_bytes, disk_usage_bytes,
-                 auto_lifecycle_authority,
-                 missing_publish_count, observed_at, updated_at
-             )
-             SELECT
-                 changed_or_missing.sandbox_id,
-                 $1,
-                status,
-                runtime,
-                spaced_version,
-                runtime_version,
-                 guest_os,
-                 guest_arch,
-                 state_format_name,
-                 state_format_version,
-                 execution_metadata,
-                 pid,
-                 namespace,
-                 uptime,
-                 sandbox_owner,
-                 sandbox_user,
-                 image_hash,
-                 COALESCE(snapshots_enabled, FALSE),
-                 template,
-                 pool_template,
-                 failure_reason,
-                 observed_created_at,
-                network_tx_bytes,
-                network_rx_bytes,
-                disk_usage_bytes,
-                auto_lifecycle_authority,
-                0,
-                NOW(),
-                NOW()
-             FROM changed_or_missing
-             ON CONFLICT (sandbox_id) DO UPDATE
-             SET node_id = EXCLUDED.node_id,
-                 status = EXCLUDED.status,
-                 runtime = EXCLUDED.runtime,
-                 spaced_version = EXCLUDED.spaced_version,
-                 runtime_version = EXCLUDED.runtime_version,
-                 guest_os = EXCLUDED.guest_os,
-                 guest_arch = EXCLUDED.guest_arch,
-                 state_format_name = EXCLUDED.state_format_name,
-                 state_format_version = EXCLUDED.state_format_version,
-                 execution_metadata = EXCLUDED.execution_metadata,
-                 pid = EXCLUDED.pid,
-                 namespace = EXCLUDED.namespace,
-                 uptime = EXCLUDED.uptime,
-                 sandbox_owner = EXCLUDED.sandbox_owner,
-                 sandbox_user = EXCLUDED.sandbox_user,
-                 image_hash = EXCLUDED.image_hash,
-                 snapshots_enabled = EXCLUDED.snapshots_enabled,
-                 template = EXCLUDED.template,
-                 pool_template = EXCLUDED.pool_template,
-                 failure_reason = EXCLUDED.failure_reason,
-                 observed_created_at = EXCLUDED.observed_created_at,
-                 network_tx_bytes = EXCLUDED.network_tx_bytes,
-                 network_rx_bytes = EXCLUDED.network_rx_bytes,
-                 disk_usage_bytes = COALESCE(
-                     EXCLUDED.disk_usage_bytes,
-                     sandbox_observed_states.disk_usage_bytes
-                 ),
-                 auto_lifecycle_authority = EXCLUDED.auto_lifecycle_authority,
-                 missing_publish_count = 0,
-                 observed_at = EXCLUDED.observed_at,
-                 updated_at = NOW()
-            WHERE {conflict_current} IS DISTINCT FROM {conflict_excluded}
-            RETURNING sandbox_id, (xmax = 0) AS inserted
-        )
-         SELECT publishable.sandbox_id,
-                publishable.assigned_to_node,
-                COALESCE(upserted.inserted, FALSE) AS inserted,
-                COALESCE(NOT upserted.inserted, FALSE) AS updated,
-                NOT EXISTS (
-                    SELECT 1
-                    FROM existing
-                    WHERE existing.sandbox_id = publishable.sandbox_id
-                ) AS first_seen,
-                publishable.status AS published_status,
-                publishable.state_changed_at,
-                observed_current.sandbox_id IS NULL
-                    OR observed_current.status IS DISTINCT FROM publishable.status
-                    AS status_changed
-         FROM publishable
-         LEFT JOIN upserted ON upserted.sandbox_id = publishable.sandbox_id
-         LEFT JOIN observed_current ON observed_current.sandbox_id = publishable.sandbox_id",
-        prefilter_current = observed_state_stored_tuple("observed_current"),
-        prefilter_incoming = observed_state_incoming_tuple("publishable"),
-        conflict_current = observed_state_stored_tuple("sandbox_observed_states"),
-        conflict_excluded = observed_state_excluded_tuple(),
-    );
-    let rows_json = Json(serde_json::Value::Array(rows));
-    let accepted_rows = sqlx::query_as::<_, AcceptedSandboxPublishRow>(sqlx::AssertSqlSafe(sql!(
-        observed_state_write_sql.as_str(),
-    )))
-    .bind(node_id)
-    .bind(rows_json.clone())
-    .fetch_all(&mut *conn)
-    .await
-    .map_err(|err| Status::internal(format!("write published sandbox observed state: {err}")))?;
-
-    let inserted_count = accepted_rows.iter().filter(|row| row.inserted).count();
-    let updated_count = accepted_rows.iter().filter(|row| row.updated).count();
-    let unchanged_count = accepted_rows
-        .len()
-        .saturating_sub(inserted_count.saturating_add(updated_count));
-    tracing::debug!(
-        %node_id,
-        accepted = accepted_rows.len(),
-        inserted = inserted_count,
-        updated = updated_count,
-        unchanged = unchanged_count,
-        "published sandbox observed state diff applied"
-    );
+    let rows_json = Json(serde_json::to_value(&rows).map_err(|error| {
+        Status::internal(format!("serialize published sandbox state: {error}"))
+    })?);
+    let accepted_rows = write_observed_states(conn, node_id, &rows).await?;
 
     let accepted_ids = accepted_rows
         .iter()
@@ -2522,231 +2260,15 @@ pub async fn publish_sandbox_states(
             changed_at: row.state_changed_at?,
         })
     }));
-    sqlx::query(sql!(
-        "WITH input AS (
-             SELECT *
-             FROM jsonb_to_recordset($2::jsonb) AS input(
-                 sandbox_id UUID,
-                 quarantine_recovery_payload JSONB,
-                 quarantine_recovery_observation_degraded BOOLEAN
-             )
-         ),
-         publishable AS (
-             SELECT input.*
-             FROM input
-             WHERE NOT COALESCE(input.quarantine_recovery_observation_degraded, FALSE)
-               AND input.quarantine_recovery_payload IS NOT NULL
-         )
-         INSERT INTO node_facet_observed_status (
-             node_id, facet, element, observed_payload, observed_at, updated_at
-         )
-         SELECT
-             $1,
-             $3,
-             publishable.sandbox_id::TEXT,
-             jsonb_build_object(
-                 'quarantine_recovery',
-                 publishable.quarantine_recovery_payload
-             ),
-             NOW(),
-             NOW()
-         FROM publishable
-         ON CONFLICT (node_id, facet, element) DO UPDATE
-         SET observed_payload =
-                 COALESCE(node_facet_observed_status.observed_payload, '{}'::JSONB)
-                 || EXCLUDED.observed_payload,
-             observed_at = EXCLUDED.observed_at,
-             updated_at = NOW()
-         WHERE node_facet_observed_status.observed_payload -> 'quarantine_recovery'
-               IS DISTINCT FROM EXCLUDED.observed_payload -> 'quarantine_recovery'
-            OR node_facet_observed_status.observed_at
-               < NOW() - make_interval(secs => $4::BIGINT)"
-    ))
-    .bind(node_id)
-    .bind(rows_json.clone())
-    .bind(FACET_SANDBOX_DESIRED_STATE)
-    .bind(QUARANTINE_RECOVERY_OBSERVATION_HEARTBEAT_SECS)
-    .execute(&mut *conn)
-    .await
-    .map_err(|err| {
-        Status::internal(format!(
-            "write published quarantine recovery observation: {err}"
-        ))
-    })?;
-    sqlx::query(sql!(
-        "WITH input AS (
-             SELECT *
-             FROM jsonb_to_recordset($2::jsonb) AS input(
-                 sandbox_id UUID,
-                 quarantine_recovery_payload JSONB,
-                 quarantine_recovery_observation_degraded BOOLEAN
-             )
-         ),
-         clearable AS (
-             SELECT input.sandbox_id
-             FROM input
-             WHERE NOT COALESCE(input.quarantine_recovery_observation_degraded, FALSE)
-               AND input.quarantine_recovery_payload IS NULL
-         )
-         UPDATE node_facet_observed_status observed
-         SET observed_payload = COALESCE(observed.observed_payload, '{}'::JSONB)
-                                    - 'quarantine_recovery',
-             observed_at = NOW(),
-             updated_at = NOW()
-         FROM clearable
-         WHERE observed.node_id = $1
-           AND observed.facet = $3
-           AND observed.element = clearable.sandbox_id::TEXT
-           AND observed.observed_payload ? 'quarantine_recovery'"
-    ))
-    .bind(node_id)
-    .bind(rows_json.clone())
-    .bind(FACET_SANDBOX_DESIRED_STATE)
-    .execute(&mut *conn)
-    .await
-    .map_err(|err| {
-        Status::internal(format!(
-            "clear published quarantine recovery observation: {err}"
-        ))
-    })?;
-    sqlx::query(sql!(
-        "WITH input AS (
-         SELECT *
-         FROM jsonb_to_recordset($2::jsonb) AS input(
-             sandbox_id UUID,
-             last_used_at TIMESTAMPTZ,
-             last_access_at TIMESTAMPTZ,
-             last_command_at TIMESTAMPTZ
-         )
-     ),
-     activity AS (
-         SELECT input.sandbox_id,
-                input.last_access_at,
-                input.last_command_at,
-                (
-                    SELECT MAX(value)
-                    FROM (
-                        VALUES
-                            (input.last_used_at),
-                            (input.last_access_at),
-                            (input.last_command_at)
-                    ) AS timestamps(value)
-                ) AS last_used_at
-         FROM input
-     ),
-     publishable AS (
-         SELECT activity.*
-         FROM activity
-         JOIN sandboxes s ON s.id = activity.sandbox_id
-         WHERE s.active_node_id = $1
-           AND activity.last_used_at IS NOT NULL
-     )
-     UPDATE sandboxes s
-     SET last_access_at = CASE
-             WHEN publishable.last_access_at IS NOT NULL
-              AND (
-                  s.last_access_at IS NULL
-                  OR s.last_access_at < publishable.last_access_at - INTERVAL '1 minute'
-              )
-             THEN publishable.last_access_at
-             ELSE s.last_access_at
-         END,
-         last_command_at = CASE
-             WHEN publishable.last_command_at IS NOT NULL
-              AND (
-                  s.last_command_at IS NULL
-                  OR s.last_command_at < publishable.last_command_at - INTERVAL '1 minute'
-              )
-             THEN publishable.last_command_at
-             ELSE s.last_command_at
-         END,
-         last_used_at = CASE
-             WHEN publishable.last_used_at IS NOT NULL
-              AND (
-                  s.last_used_at IS NULL
-                  OR s.last_used_at < publishable.last_used_at - INTERVAL '1 minute'
-              )
-             THEN publishable.last_used_at
-             ELSE s.last_used_at
-         END
-     FROM publishable
-     WHERE s.id = publishable.sandbox_id
-       AND (
-           (
-               publishable.last_access_at IS NOT NULL
-               AND (
-                   s.last_access_at IS NULL
-                   OR s.last_access_at < publishable.last_access_at - INTERVAL '1 minute'
-               )
-           )
-           OR (
-               publishable.last_command_at IS NOT NULL
-               AND (
-                   s.last_command_at IS NULL
-                   OR s.last_command_at < publishable.last_command_at - INTERVAL '1 minute'
-               )
-           )
-           OR (
-               publishable.last_used_at IS NOT NULL
-               AND (
-                   s.last_used_at IS NULL
-                   OR s.last_used_at < publishable.last_used_at - INTERVAL '1 minute'
-               )
-           )
-       )"
-    ))
-    .bind(node_id)
-    .bind(rows_json.clone())
-    .execute(&mut *conn)
-    .await
-    .map_err(|err| Status::internal(format!("update sandbox last_used_at from publish: {err}")))?;
+    reconcile_recovery_observations(conn, node_id, &rows).await?;
+    update_activity_timestamps(conn, node_id, &rows).await?;
 
     let first_seen_sandbox_ids = accepted_rows
         .iter()
         .filter(|row| row.assigned_to_node && row.first_seen)
         .map(|row| row.sandbox_id)
         .collect::<Vec<_>>();
-    // Publishing `started` proves the node-local runtime finished, but for
-    // Kubernetes sandboxes the control plane also needs a routable active
-    // execution row. The blocking wake/restore path is what hydrates that row
-    // with `running` + pod IP; if it timed out first, keep the row in
-    // `restoring` so the next connect can wait on and hydrate the in-flight
-    // pod instead of treating it as a started sandbox with a broken execution.
-    // Evacuation-marked rows are owned by the node-drain redrive (the same
-    // exemption the sweeper makes) and are left alone.
-    let routable_execution =
-        pplx_space_common_svc::sql::sandbox_routability::routable_execution_or_non_k8s("s", "$4");
-    let restored_convergence_query = format!(
-        "WITH input AS (
-             SELECT *
-             FROM jsonb_to_recordset($2::jsonb) AS input(
-                 sandbox_id UUID,
-                 status TEXT,
-                 transition_receipt_kind TEXT
-             )
-         )
-         UPDATE sandboxes s
-         SET lifecycle = 'started'
-         FROM input
-         WHERE s.id = input.sandbox_id
-           AND s.active_node_id = $1
-           AND s.evacuation_restore_target IS NULL
-           AND LOWER(TRIM(input.status)) = 'started'
-           AND input.transition_receipt_kind IS DISTINCT FROM $3
-           AND LOWER(TRIM(s.lifecycle)) = 'restoring'
-           AND {routable_execution}
-         RETURNING s.id"
-    );
-    let restored_ids = sqlx::query_scalar::<_, SandboxId>(sqlx::AssertSqlSafe(sql!(
-        restored_convergence_query.as_str()
-    )))
-    .bind(node_id)
-    .bind(rows_json.clone())
-    .bind(SandboxTransitionReceiptKind::ActivationCompleted.as_str())
-    .bind(SubstrateKind::Kubernetes)
-    .fetch_all(&mut *conn)
-    .await
-    .map_err(|err| Status::internal(format!("converge restored sandbox lifecycle: {err}")))?;
+    let restored_ids = converge_restored_sandboxes(conn, node_id, &rows).await?;
     emit_lifecycle_convergence_events(
         node_id,
         &restored_ids,
@@ -2755,39 +2277,10 @@ pub async fn publish_sandbox_states(
         "started",
     );
 
-    crate::sandbox_quarantine_store::consume_activation_completion_receipts(
-        conn,
-        node_id,
-        rows_json.clone(),
-    )
-    .await?;
-
-    let rollback_candidates =
-        crate::sandbox_quarantine_store::select_activation_rollback_candidates(
-            conn,
-            node_id,
-            rows_json.clone(),
-        )
-        .await?;
-    let applied_rollbacks = crate::sandbox_quarantine_store::apply_activation_rollback_candidates(
-        conn,
-        node_id,
-        rollback_candidates,
-    )
-    .await?;
-    post_commit_events.extend(applied_rollbacks.into_iter().map(|rollback| {
-        PostCommitSandboxEvent {
-            sandbox_id: rollback.sandbox_id,
-            event_type: SandboxEventType::ActivationRollbackCompleted,
-            prior_lifecycle: rollback.prior_lifecycle,
-            target_lifecycle: rollback.target_state,
-            reason_code: rollback.reason_code,
-            error: rollback.failure_message,
-        }
-    }));
+    post_commit_events.extend(apply_activation_receipts(conn, node_id, &rows, retirement).await?);
 
     let suspended_projection =
-        project_node_published_suspended_sandboxes(conn, node_id, rows_json.clone()).await?;
+        project_node_published_suspended_sandboxes(conn, node_id, &rows).await?;
     let recovered_ids = suspended_projection
         .recoveries
         .iter()
@@ -2817,34 +2310,7 @@ pub async fn publish_sandbox_states(
         },
     ));
 
-    let stopped_ids = sqlx::query_scalar::<_, SandboxId>(sql!(
-        "WITH input AS (
-             SELECT *
-             FROM jsonb_to_recordset($2::jsonb) AS input(
-                 sandbox_id UUID,
-                 status TEXT
-             )
-         )
-         UPDATE sandboxes s
-         SET lifecycle = 'stopped'
-         FROM input
-         WHERE s.id = input.sandbox_id
-           AND s.active_node_id = $1
-           AND LOWER(TRIM(input.status)) = 'stopped'
-           AND LOWER(TRIM(s.lifecycle)) IN (
-               'started',
-               'paused',
-               'suspended',
-               'stopping',
-               'restoring'
-           )
-         RETURNING s.id"
-    ))
-    .bind(node_id)
-    .bind(rows_json.clone())
-    .fetch_all(&mut *conn)
-    .await
-    .map_err(|err| Status::internal(format!("promote stopped sandbox lifecycle: {err}")))?;
+    let stopped_ids = converge_stopped_sandboxes(conn, node_id, &rows).await?;
     emit_lifecycle_convergence_events(
         node_id,
         &stopped_ids,
@@ -2853,8 +2319,7 @@ pub async fn publish_sandbox_states(
         "stopped",
     );
 
-    let failed_sandboxes =
-        project_node_published_failed_sandboxes(conn, node_id, rows_json.clone()).await?;
+    let failed_sandboxes = converge_failed_sandboxes(conn, node_id, &rows).await?;
     emit_node_published_state_events(
         node_id,
         &failed_sandboxes,
@@ -3071,23 +2536,7 @@ pub async fn publish_sandbox_states(
         );
     }
 
-    let pause_failed_recoveries =
-        crate::sandbox_quarantine_store::recover_pause_failed_from_inventory(
-            conn,
-            node_id,
-            rows_json.clone(),
-        )
-        .await?;
-    post_commit_events.extend(pause_failed_recoveries.into_iter().map(|recovery| {
-        PostCommitSandboxEvent {
-            sandbox_id: recovery.sandbox_id,
-            event_type: SandboxEventType::QuarantineRecovered,
-            prior_lifecycle: SandboxLifecycle::Quarantined,
-            target_lifecycle: recovery.target_state,
-            reason_code: SandboxQuarantineReasonCode::PauseFailed,
-            error: None,
-        }
-    }));
+    post_commit_events.extend(recover_pause_failed_sandboxes(conn, node_id, &rows).await?);
 
     queue_policy_reconcile_refs_for_new_inventory(
         conn,
@@ -3287,6 +2736,7 @@ async fn project_node_published_failed_sandboxes(
         .collect())
 }
 
+#[derive(Default)]
 struct SuspendedProjectionOutcome {
     rows: Vec<(SandboxId, bool)>,
     recoveries: Vec<(SandboxId, SandboxLifecycle, SandboxQuarantineReasonCode)>,
@@ -3298,8 +2748,18 @@ struct SuspendedProjectionOutcome {
 async fn project_node_published_suspended_sandboxes(
     conn: &mut sqlx::PgConnection,
     node_id: NodeId,
-    rows_json: Json<serde_json::Value>,
+    rows: &[PublishedSandboxRow],
 ) -> Result<SuspendedProjectionOutcome, Status> {
+    let suspended_rows = rows
+        .iter()
+        .filter(|row| row.may_report_lifecycle(SandboxLifecycle::Suspended))
+        .collect::<Vec<_>>();
+    if suspended_rows.is_empty() {
+        return Ok(SuspendedProjectionOutcome::default());
+    }
+    let rows_json = Json(serde_json::to_value(suspended_rows).map_err(|error| {
+        Status::internal(format!("serialize suspended publication rows: {error}"))
+    })?);
     let candidates = crate::sandbox_quarantine_store::select_suspended_projection_candidates(
         conn, node_id, rows_json,
     )
@@ -3860,6 +3320,830 @@ fn snapshot_locations_json(snapshot: &SnapshotDetail) -> serde_json::Value {
             })
             .collect(),
     )
+}
+
+/// Apply the node-owned observed-state batch and report accepted rows.
+/// The caller retains the publication transaction and subsequent receipt ordering.
+async fn write_observed_states(
+    conn: &mut sqlx::PgConnection,
+    node_id: NodeId,
+    rows: &[PublishedSandboxRow],
+) -> Result<Vec<AcceptedSandboxPublishRow>, Status> {
+    // Typed arrays avoid decoding the entire publication JSON for this hot write.
+    // Keep the ownership and difference guards with the transition in this transaction.
+    let accepted_rows = sqlx::query_as::<_, AcceptedSandboxPublishRow>(sql!(
+        "WITH input AS (
+             SELECT input.sandbox_id,
+                    input.status,
+                    input.state_changed_at::TIMESTAMPTZ AS state_changed_at,
+                    input.template,
+                    input.runtime,
+                    input.spaced_version,
+                    input.runtime_version,
+                    input.guest_os,
+                    input.guest_arch,
+                    input.state_format_name,
+                    input.state_format_version,
+                    input.execution_metadata,
+                    input.pid,
+                    input.namespace,
+                    input.uptime,
+                    input.sandbox_owner,
+                    input.sandbox_user,
+                    input.image_hash,
+                    input.snapshots_enabled,
+                    input.pool_template,
+                    input.failure_reason,
+                    input.observed_created_at,
+                    input.network_tx_bytes,
+                    input.network_rx_bytes,
+                    input.disk_usage_bytes,
+                    input.auto_lifecycle_authority
+             FROM UNNEST(
+                 $2::UUID[],
+                 $3::TEXT[],
+                 $4::TEXT[],
+                 $5::TEXT[],
+                 $6::TEXT[],
+                 $7::TEXT[],
+                 $8::TEXT[],
+                 $9::TEXT[],
+                 $10::TEXT[],
+                 $11::TEXT[],
+                 $12::TEXT[],
+                 $13::JSONB[],
+                 $14::INTEGER[],
+                 $15::TEXT[],
+                 $16::TEXT[],
+                 $17::TEXT[],
+                 $18::TEXT[],
+                 $19::TEXT[],
+                 $20::BOOLEAN[],
+                 $21::TEXT[],
+                 $22::TEXT[],
+                 $23::TEXT[],
+                 $24::BIGINT[],
+                 $25::BIGINT[],
+                 $26::BIGINT[],
+                 $27::TEXT[]
+             ) AS input(
+                 sandbox_id,
+                 status,
+                 state_changed_at,
+                 template,
+                 runtime,
+                 spaced_version,
+                 runtime_version,
+                 guest_os,
+                 guest_arch,
+                 state_format_name,
+                 state_format_version,
+                 execution_metadata,
+                 pid,
+                 namespace,
+                 uptime,
+                 sandbox_owner,
+                 sandbox_user,
+                 image_hash,
+                 snapshots_enabled,
+                 pool_template,
+                 failure_reason,
+                 observed_created_at,
+                 network_tx_bytes,
+                 network_rx_bytes,
+                 disk_usage_bytes,
+                 auto_lifecycle_authority
+             )
+         ),
+         publishable AS (
+             SELECT input.*,
+                    s.id IS NOT NULL AS assigned_to_node
+             FROM input
+             LEFT JOIN sandboxes s ON s.id = input.sandbox_id
+             LEFT JOIN sandbox_direct_route_identities direct_route
+               ON direct_route.sandbox_id = s.id
+             WHERE s.id IS NULL
+                OR COALESCE(direct_route.current_node_id, s.active_node_id) = $1
+         ),
+         observed_current AS MATERIALIZED (
+             SELECT sos.*
+             FROM sandbox_observed_states sos
+             JOIN publishable ON publishable.sandbox_id = sos.sandbox_id
+         ),
+         existing AS (
+             SELECT DISTINCT sandbox_id
+             FROM observed_current
+             WHERE node_id = $1
+         ),
+         changed_or_missing AS MATERIALIZED (
+             SELECT publishable.*
+             FROM publishable
+             LEFT JOIN observed_current ON observed_current.sandbox_id = publishable.sandbox_id
+             WHERE observed_current.sandbox_id IS NULL
+                OR (observed_current.node_id,
+                 observed_current.status,
+                 observed_current.runtime,
+                 observed_current.spaced_version,
+                 observed_current.runtime_version,
+                 observed_current.guest_os,
+                 observed_current.guest_arch,
+                 observed_current.state_format_name,
+                 observed_current.state_format_version,
+                 observed_current.execution_metadata,
+                 observed_current.pid,
+                 observed_current.namespace,
+                 observed_current.uptime,
+                 observed_current.sandbox_owner,
+                 observed_current.sandbox_user,
+                 observed_current.image_hash,
+                 observed_current.snapshots_enabled,
+                 observed_current.template,
+                 observed_current.pool_template,
+                 observed_current.failure_reason,
+                 observed_current.observed_created_at,
+                 observed_current.network_tx_bytes,
+                 observed_current.network_rx_bytes,
+                 observed_current.disk_usage_bytes,
+                 observed_current.auto_lifecycle_authority,
+                 observed_current.missing_publish_count) IS DISTINCT FROM ($1,
+                 publishable.status,
+                 publishable.runtime,
+                 publishable.spaced_version,
+                 publishable.runtime_version,
+                 publishable.guest_os,
+                 publishable.guest_arch,
+                 publishable.state_format_name,
+                 publishable.state_format_version,
+                 publishable.execution_metadata,
+                 publishable.pid,
+                 publishable.namespace,
+                 publishable.uptime,
+                 publishable.sandbox_owner,
+                 publishable.sandbox_user,
+                 publishable.image_hash,
+                 COALESCE(publishable.snapshots_enabled, FALSE),
+                 publishable.template,
+                 publishable.pool_template,
+                 publishable.failure_reason,
+                 publishable.observed_created_at,
+                 publishable.network_tx_bytes,
+                 publishable.network_rx_bytes,
+                 COALESCE(publishable.disk_usage_bytes, observed_current.disk_usage_bytes),
+                 publishable.auto_lifecycle_authority,
+                 0)
+         ),
+         upserted AS (
+             INSERT INTO sandbox_observed_states (
+                 sandbox_id, node_id, status, runtime, spaced_version, runtime_version, guest_os, guest_arch,
+                 state_format_name, state_format_version, execution_metadata, pid, namespace, uptime,
+                 sandbox_owner, sandbox_user, image_hash,
+                 snapshots_enabled, template, pool_template, failure_reason,
+                 observed_created_at, network_tx_bytes, network_rx_bytes, disk_usage_bytes,
+                 auto_lifecycle_authority,
+                 missing_publish_count, observed_at, updated_at
+             )
+             SELECT
+                 changed_or_missing.sandbox_id,
+                 $1,
+                status,
+                runtime,
+                spaced_version,
+                runtime_version,
+                 guest_os,
+                 guest_arch,
+                 state_format_name,
+                 state_format_version,
+                 execution_metadata,
+                 pid,
+                 namespace,
+                 uptime,
+                 sandbox_owner,
+                 sandbox_user,
+                 image_hash,
+                 COALESCE(snapshots_enabled, FALSE),
+                 template,
+                 pool_template,
+                 failure_reason,
+                 observed_created_at,
+                network_tx_bytes,
+                network_rx_bytes,
+                disk_usage_bytes,
+                auto_lifecycle_authority,
+                0,
+                NOW(),
+                NOW()
+             FROM changed_or_missing
+             ON CONFLICT (sandbox_id) DO UPDATE
+             SET node_id = EXCLUDED.node_id,
+                 status = EXCLUDED.status,
+                 runtime = EXCLUDED.runtime,
+                 spaced_version = EXCLUDED.spaced_version,
+                 runtime_version = EXCLUDED.runtime_version,
+                 guest_os = EXCLUDED.guest_os,
+                 guest_arch = EXCLUDED.guest_arch,
+                 state_format_name = EXCLUDED.state_format_name,
+                 state_format_version = EXCLUDED.state_format_version,
+                 execution_metadata = EXCLUDED.execution_metadata,
+                 pid = EXCLUDED.pid,
+                 namespace = EXCLUDED.namespace,
+                 uptime = EXCLUDED.uptime,
+                 sandbox_owner = EXCLUDED.sandbox_owner,
+                 sandbox_user = EXCLUDED.sandbox_user,
+                 image_hash = EXCLUDED.image_hash,
+                 snapshots_enabled = EXCLUDED.snapshots_enabled,
+                 template = EXCLUDED.template,
+                 pool_template = EXCLUDED.pool_template,
+                 failure_reason = EXCLUDED.failure_reason,
+                 observed_created_at = EXCLUDED.observed_created_at,
+                 network_tx_bytes = EXCLUDED.network_tx_bytes,
+                 network_rx_bytes = EXCLUDED.network_rx_bytes,
+                 disk_usage_bytes = COALESCE(
+                     EXCLUDED.disk_usage_bytes,
+                     sandbox_observed_states.disk_usage_bytes
+                 ),
+                 auto_lifecycle_authority = EXCLUDED.auto_lifecycle_authority,
+                 missing_publish_count = 0,
+                 observed_at = EXCLUDED.observed_at,
+                 updated_at = NOW()
+            WHERE (sandbox_observed_states.node_id,
+                 sandbox_observed_states.status,
+                 sandbox_observed_states.runtime,
+                 sandbox_observed_states.spaced_version,
+                 sandbox_observed_states.runtime_version,
+                 sandbox_observed_states.guest_os,
+                 sandbox_observed_states.guest_arch,
+                 sandbox_observed_states.state_format_name,
+                 sandbox_observed_states.state_format_version,
+                 sandbox_observed_states.execution_metadata,
+                 sandbox_observed_states.pid,
+                 sandbox_observed_states.namespace,
+                 sandbox_observed_states.uptime,
+                 sandbox_observed_states.sandbox_owner,
+                 sandbox_observed_states.sandbox_user,
+                 sandbox_observed_states.image_hash,
+                 sandbox_observed_states.snapshots_enabled,
+                 sandbox_observed_states.template,
+                 sandbox_observed_states.pool_template,
+                 sandbox_observed_states.failure_reason,
+                 sandbox_observed_states.observed_created_at,
+                 sandbox_observed_states.network_tx_bytes,
+                 sandbox_observed_states.network_rx_bytes,
+                 sandbox_observed_states.disk_usage_bytes,
+                 sandbox_observed_states.auto_lifecycle_authority,
+                 sandbox_observed_states.missing_publish_count) IS DISTINCT FROM (EXCLUDED.node_id,
+                 EXCLUDED.status,
+                 EXCLUDED.runtime,
+                 EXCLUDED.spaced_version,
+                 EXCLUDED.runtime_version,
+                 EXCLUDED.guest_os,
+                 EXCLUDED.guest_arch,
+                 EXCLUDED.state_format_name,
+                 EXCLUDED.state_format_version,
+                 EXCLUDED.execution_metadata,
+                 EXCLUDED.pid,
+                 EXCLUDED.namespace,
+                 EXCLUDED.uptime,
+                 EXCLUDED.sandbox_owner,
+                 EXCLUDED.sandbox_user,
+                 EXCLUDED.image_hash,
+                 EXCLUDED.snapshots_enabled,
+                 EXCLUDED.template,
+                 EXCLUDED.pool_template,
+                 EXCLUDED.failure_reason,
+                 EXCLUDED.observed_created_at,
+                 EXCLUDED.network_tx_bytes,
+                 EXCLUDED.network_rx_bytes,
+                 COALESCE(EXCLUDED.disk_usage_bytes, sandbox_observed_states.disk_usage_bytes),
+                 EXCLUDED.auto_lifecycle_authority,
+                 0)
+            RETURNING sandbox_id, (xmax = 0) AS inserted
+        )
+         SELECT publishable.sandbox_id,
+                publishable.assigned_to_node,
+                COALESCE(upserted.inserted, FALSE) AS inserted,
+                COALESCE(NOT upserted.inserted, FALSE) AS updated,
+                NOT EXISTS (
+                    SELECT 1
+                    FROM existing
+                    WHERE existing.sandbox_id = publishable.sandbox_id
+                ) AS first_seen,
+                publishable.status AS published_status,
+                publishable.state_changed_at,
+                observed_current.sandbox_id IS NULL
+                    OR observed_current.status IS DISTINCT FROM publishable.status
+                    AS status_changed
+         FROM publishable
+         LEFT JOIN upserted ON upserted.sandbox_id = publishable.sandbox_id
+         LEFT JOIN observed_current ON observed_current.sandbox_id = publishable.sandbox_id"
+    ))
+    .bind(node_id)
+    .bind(rows.iter().map(|row| row.sandbox_id).collect::<Vec<_>>())
+    .bind(rows.iter().map(|row| row.status.as_deref()).collect::<Vec<_>>())
+    .bind(rows.iter().map(|row| row.state_changed_at.as_deref()).collect::<Vec<_>>())
+    .bind(rows.iter().map(|row| row.template.as_deref()).collect::<Vec<_>>())
+    .bind(rows.iter().map(|row| row.runtime.as_deref()).collect::<Vec<_>>())
+    .bind(rows.iter().map(|row| row.spaced_version.as_deref()).collect::<Vec<_>>())
+    .bind(rows.iter().map(|row| row.runtime_version.as_deref()).collect::<Vec<_>>())
+    .bind(rows.iter().map(|row| row.guest_os.as_deref()).collect::<Vec<_>>())
+    .bind(rows.iter().map(|row| row.guest_arch.as_deref()).collect::<Vec<_>>())
+    .bind(rows.iter().map(|row| row.state_format_name.as_deref()).collect::<Vec<_>>())
+    .bind(rows.iter().map(|row| row.state_format_version.as_deref()).collect::<Vec<_>>())
+    // jsonb_to_recordset treated both an absent value and JSON null as SQL NULL.
+    .bind(rows.iter().map(|row| row.execution_metadata.as_ref().filter(|value| !value.is_null()).map(Json)).collect::<Vec<_>>())
+    .bind(rows.iter().map(|row| row.pid).collect::<Vec<_>>())
+    .bind(rows.iter().map(|row| row.namespace.as_deref()).collect::<Vec<_>>())
+    .bind(rows.iter().map(|row| row.uptime.as_deref()).collect::<Vec<_>>())
+    .bind(rows.iter().map(|row| row.sandbox_owner.as_deref()).collect::<Vec<_>>())
+    .bind(rows.iter().map(|row| row.sandbox_user.as_deref()).collect::<Vec<_>>())
+    .bind(rows.iter().map(|row| row.image_hash.as_deref()).collect::<Vec<_>>())
+    .bind(rows.iter().map(|row| row.snapshots_enabled).collect::<Vec<_>>())
+    .bind(rows.iter().map(|row| row.pool_template.as_deref()).collect::<Vec<_>>())
+    .bind(rows.iter().map(|row| row.failure_reason.as_deref()).collect::<Vec<_>>())
+    .bind(rows.iter().map(|row| row.observed_created_at.as_deref()).collect::<Vec<_>>())
+    .bind(rows.iter().map(|row| row.network_tx_bytes).collect::<Vec<_>>())
+    .bind(rows.iter().map(|row| row.network_rx_bytes).collect::<Vec<_>>())
+    .bind(rows.iter().map(|row| row.disk_usage_bytes).collect::<Vec<_>>())
+    .bind(rows.iter().map(|row| row.auto_lifecycle_authority).collect::<Vec<_>>())
+    .fetch_all(&mut *conn)
+    .await
+    .map_err(|err| Status::internal(format!("write published sandbox observed state: {err}")))?;
+
+    let inserted_count = accepted_rows.iter().filter(|row| row.inserted).count();
+    let updated_count = accepted_rows.iter().filter(|row| row.updated).count();
+    let unchanged_count = accepted_rows
+        .len()
+        .saturating_sub(inserted_count.saturating_add(updated_count));
+    tracing::debug!(
+        %node_id,
+        accepted = accepted_rows.len(),
+        inserted = inserted_count,
+        updated = updated_count,
+        unchanged = unchanged_count,
+        "published sandbox observed state diff applied"
+    );
+    Ok(accepted_rows)
+}
+
+/// Consume matching activation receipts within the publication transaction.
+/// Return only the events that become publishable after its caller commits.
+async fn apply_activation_receipts(
+    conn: &mut sqlx::PgConnection,
+    node_id: NodeId,
+    rows: &[PublishedSandboxRow],
+    retirement: pplx_space_common_core::types::AbandonedRestoreRetirement,
+) -> Result<Vec<PostCommitSandboxEvent>, Status> {
+    // These statements require an exact receipt kind. Empty receipt batches
+    // cannot release or lock an execution, so ordinary reports need neither query.
+    let activation_completions = rows
+        .iter()
+        .filter(|row| {
+            row.transition_receipt_kind
+                == Some(SandboxTransitionReceiptKind::ActivationCompleted.as_str())
+        })
+        .collect::<Vec<_>>();
+    if !activation_completions.is_empty() {
+        let receipt_rows = Json(
+            serde_json::to_value(activation_completions).map_err(|error| {
+                Status::internal(format!("serialize activation completion receipts: {error}"))
+            })?,
+        );
+        crate::sandbox_quarantine_store::consume_activation_completion_receipts(
+            conn,
+            node_id,
+            receipt_rows,
+        )
+        .await?;
+    }
+
+    let activation_rollbacks = rows
+        .iter()
+        .filter(|row| {
+            row.transition_receipt_kind
+                == Some(SandboxTransitionReceiptKind::ActivationRollback.as_str())
+        })
+        .collect::<Vec<_>>();
+    let rollback_candidates = if activation_rollbacks.is_empty() {
+        Vec::new()
+    } else {
+        let receipt_rows = Json(serde_json::to_value(activation_rollbacks).map_err(|error| {
+            Status::internal(format!("serialize activation rollback receipts: {error}"))
+        })?);
+        crate::sandbox_quarantine_store::select_activation_rollback_candidates(
+            conn,
+            node_id,
+            receipt_rows,
+        )
+        .await?
+    };
+    let applied_rollbacks = crate::sandbox_quarantine_store::apply_activation_rollback_candidates(
+        conn,
+        node_id,
+        rollback_candidates,
+        retirement,
+    )
+    .await?;
+    Ok(applied_rollbacks
+        .into_iter()
+        .map(|rollback| PostCommitSandboxEvent {
+            sandbox_id: rollback.sandbox_id,
+            event_type: SandboxEventType::ActivationRollbackCompleted,
+            prior_lifecycle: rollback.prior_lifecycle,
+            target_lifecycle: rollback.target_state,
+            reason_code: rollback.reason_code,
+            error: rollback.failure_message,
+        })
+        .collect())
+}
+
+/// Recover node-owned pause failures from definitive healthy observations.
+async fn recover_pause_failed_sandboxes(
+    conn: &mut sqlx::PgConnection,
+    node_id: NodeId,
+    rows: &[PublishedSandboxRow],
+) -> Result<Vec<PostCommitSandboxEvent>, Status> {
+    let healthy_rows = rows
+        .iter()
+        .filter(|row| {
+            row.may_report_lifecycle(SandboxLifecycle::Started)
+                || row.may_report_lifecycle(SandboxLifecycle::Paused)
+        })
+        .map(PublishedSandboxRow::lifecycle_projection)
+        .collect::<Vec<_>>();
+    let pause_failed_recoveries = if healthy_rows.is_empty() {
+        Vec::new()
+    } else {
+        let healthy_rows = Json(serde_json::to_value(healthy_rows).map_err(|error| {
+            Status::internal(format!("serialize healthy publication rows: {error}"))
+        })?);
+        crate::sandbox_quarantine_store::recover_pause_failed_from_inventory(
+            conn,
+            node_id,
+            healthy_rows,
+        )
+        .await?
+    };
+    Ok(pause_failed_recoveries
+        .into_iter()
+        .map(|recovery| PostCommitSandboxEvent {
+            sandbox_id: recovery.sandbox_id,
+            event_type: SandboxEventType::QuarantineRecovered,
+            prior_lifecycle: SandboxLifecycle::Quarantined,
+            target_lifecycle: recovery.target_state,
+            reason_code: SandboxQuarantineReasonCode::PauseFailed,
+            error: None,
+        })
+        .collect())
+}
+
+/// Advance the publishing node's activity clocks without changing structural timestamps.
+async fn update_activity_timestamps(
+    conn: &mut sqlx::PgConnection,
+    node_id: NodeId,
+    rows: &[PublishedSandboxRow],
+) -> Result<(), Status> {
+    let activity_rows = rows
+        .iter()
+        .map(PublishedSandboxRow::activity_projection)
+        .collect::<Vec<_>>();
+    let activity_rows = Json(serde_json::to_value(activity_rows).map_err(|error| {
+        Status::internal(format!("serialize published activity timestamps: {error}"))
+    })?);
+    // PostgreSQL GREATEST ignores absent clocks and yields NULL if all are absent.
+    // Keep publisher ownership on the updated row, avoiding a redundant self-join.
+    sqlx::query(sql!(
+        "WITH input AS (
+         SELECT *
+         FROM jsonb_to_recordset($2::jsonb) AS input(
+             sandbox_id UUID,
+             last_used_at TIMESTAMPTZ,
+             last_access_at TIMESTAMPTZ,
+             last_command_at TIMESTAMPTZ
+         )
+     ),
+     activity AS (
+         SELECT input.sandbox_id,
+                input.last_access_at,
+                input.last_command_at,
+                GREATEST(input.last_used_at, input.last_access_at, input.last_command_at) AS last_used_at
+         FROM input
+     )
+     UPDATE sandboxes s
+     SET last_access_at = CASE
+             WHEN activity.last_access_at IS NOT NULL
+              AND (
+                  s.last_access_at IS NULL
+                  OR s.last_access_at < activity.last_access_at - INTERVAL '1 minute'
+              )
+             THEN activity.last_access_at
+             ELSE s.last_access_at
+         END,
+         last_command_at = CASE
+             WHEN activity.last_command_at IS NOT NULL
+              AND (
+                  s.last_command_at IS NULL
+                  OR s.last_command_at < activity.last_command_at - INTERVAL '1 minute'
+              )
+             THEN activity.last_command_at
+             ELSE s.last_command_at
+         END,
+         last_used_at = CASE
+             WHEN activity.last_used_at IS NOT NULL
+              AND (
+                  s.last_used_at IS NULL
+                  OR s.last_used_at < activity.last_used_at - INTERVAL '1 minute'
+              )
+             THEN activity.last_used_at
+             ELSE s.last_used_at
+         END
+     FROM activity
+     WHERE s.id = activity.sandbox_id
+       AND s.active_node_id = $1
+       AND activity.last_used_at IS NOT NULL
+       AND (
+           (
+               activity.last_access_at IS NOT NULL
+               AND (
+                   s.last_access_at IS NULL
+                   OR s.last_access_at < activity.last_access_at - INTERVAL '1 minute'
+               )
+           )
+           OR (
+               activity.last_command_at IS NOT NULL
+               AND (
+                   s.last_command_at IS NULL
+                   OR s.last_command_at < activity.last_command_at - INTERVAL '1 minute'
+               )
+           )
+           OR (
+               activity.last_used_at IS NOT NULL
+               AND (
+                   s.last_used_at IS NULL
+                   OR s.last_used_at < activity.last_used_at - INTERVAL '1 minute'
+               )
+           )
+       )"
+    ))
+    .bind(node_id)
+    .bind(activity_rows)
+    .execute(&mut *conn)
+    .await
+    .map_err(|err| Status::internal(format!("update sandbox last_used_at from publish: {err}")))?;
+    Ok(())
+}
+
+async fn converge_restored_sandboxes(
+    conn: &mut sqlx::PgConnection,
+    node_id: NodeId,
+    rows: &[PublishedSandboxRow],
+) -> Result<Vec<SandboxId>, Status> {
+    // Publishing `started` proves the node-local runtime finished, but for
+    // Kubernetes sandboxes the control plane also needs a routable active
+    // execution row. The blocking wake/restore path is what hydrates that row
+    // with `running` + pod IP; if it timed out first, keep the row in
+    // `restoring` so the next connect can wait on and hydrate the in-flight
+    // pod instead of treating it as a started sandbox with a broken execution.
+    // Evacuation-marked rows are owned by the node-drain redrive (the same
+    // exemption the sweeper makes) and are left alone.
+    let routable_execution =
+        pplx_space_common_svc::sql::sandbox_routability::routable_execution_or_non_k8s("s", "$4");
+    let restored_convergence_query = format!(
+        "WITH input AS (
+             SELECT *
+             FROM jsonb_to_recordset($2::jsonb) AS input(
+                 sandbox_id UUID,
+                 status TEXT,
+                 transition_receipt_kind TEXT
+             )
+         )
+         UPDATE sandboxes s
+         SET lifecycle = 'started'
+         FROM input
+         WHERE s.id = input.sandbox_id
+           AND s.active_node_id = $1
+           AND s.evacuation_restore_target IS NULL
+           AND LOWER(TRIM(input.status)) = 'started'
+           AND input.transition_receipt_kind IS DISTINCT FROM $3
+           AND LOWER(TRIM(s.lifecycle)) = 'restoring'
+           AND {routable_execution}
+         RETURNING s.id"
+    );
+    let restored_rows = rows
+        .iter()
+        .filter(|row| {
+            row.may_report_lifecycle(SandboxLifecycle::Started)
+                && row.transition_receipt_kind
+                    != Some(SandboxTransitionReceiptKind::ActivationCompleted.as_str())
+        })
+        .map(PublishedSandboxRow::restore_projection)
+        .collect::<Vec<_>>();
+    let restored_ids = if restored_rows.is_empty() {
+        Vec::new()
+    } else {
+        let restored_rows = Json(serde_json::to_value(restored_rows).map_err(|error| {
+            Status::internal(format!("serialize restored publication rows: {error}"))
+        })?);
+        sqlx::query_scalar::<_, SandboxId>(sqlx::AssertSqlSafe(sql!(
+            restored_convergence_query.as_str()
+        )))
+        .bind(node_id)
+        .bind(restored_rows)
+        .bind(SandboxTransitionReceiptKind::ActivationCompleted.as_str())
+        .bind(SubstrateKind::Kubernetes)
+        .fetch_all(&mut *conn)
+        .await
+        .map_err(|err| Status::internal(format!("converge restored sandbox lifecycle: {err}")))?
+    };
+    Ok(restored_ids)
+}
+
+async fn converge_stopped_sandboxes(
+    conn: &mut sqlx::PgConnection,
+    node_id: NodeId,
+    rows: &[PublishedSandboxRow],
+) -> Result<Vec<SandboxId>, Status> {
+    let stopped_rows = rows
+        .iter()
+        .filter(|row| row.may_report_lifecycle(SandboxLifecycle::Stopped))
+        .map(PublishedSandboxRow::lifecycle_projection)
+        .collect::<Vec<_>>();
+    let stopped_ids = if stopped_rows.is_empty() {
+        Vec::new()
+    } else {
+        let stopped_rows = Json(serde_json::to_value(stopped_rows).map_err(|error| {
+            Status::internal(format!("serialize stopped publication rows: {error}"))
+        })?);
+        sqlx::query_scalar::<_, SandboxId>(sql!(
+            "WITH input AS (
+             SELECT *
+             FROM jsonb_to_recordset($2::jsonb) AS input(
+                 sandbox_id UUID,
+                 status TEXT
+             )
+         )
+         UPDATE sandboxes s
+         SET lifecycle = 'stopped'
+         FROM input
+         WHERE s.id = input.sandbox_id
+           AND s.active_node_id = $1
+           AND LOWER(TRIM(input.status)) = 'stopped'
+           AND LOWER(TRIM(s.lifecycle)) IN (
+               'started',
+               'paused',
+               'suspended',
+               'stopping',
+               'restoring'
+           )
+         RETURNING s.id"
+        ))
+        .bind(node_id)
+        .bind(stopped_rows)
+        .fetch_all(&mut *conn)
+        .await
+        .map_err(|err| Status::internal(format!("promote stopped sandbox lifecycle: {err}")))?
+    };
+    Ok(stopped_ids)
+}
+
+async fn converge_failed_sandboxes(
+    conn: &mut sqlx::PgConnection,
+    node_id: NodeId,
+    rows: &[PublishedSandboxRow],
+) -> Result<Vec<(SandboxId, String)>, Status> {
+    let failed_rows = rows
+        .iter()
+        .filter(|row| row.may_report_lifecycle(SandboxLifecycle::Failed))
+        .map(PublishedSandboxRow::lifecycle_projection)
+        .collect::<Vec<_>>();
+    if failed_rows.is_empty() {
+        return Ok(Vec::new());
+    }
+    let rows_json = Json(serde_json::to_value(failed_rows).map_err(|error| {
+        Status::internal(format!("serialize failed publication rows: {error}"))
+    })?);
+    project_node_published_failed_sandboxes(conn, node_id, rows_json).await
+}
+
+/// Reconcile node-scoped recovery evidence while preserving degraded observations.
+async fn reconcile_recovery_observations(
+    conn: &mut sqlx::PgConnection,
+    node_id: NodeId,
+    rows: &[PublishedSandboxRow],
+) -> Result<(), Status> {
+    let recovery_rows = rows
+        .iter()
+        .filter(|row| {
+            !row.quarantine_recovery_observation_degraded && row.has_recovery_observation()
+        })
+        .map(PublishedSandboxRow::recovery_observation_projection)
+        .collect::<Vec<_>>();
+    if !recovery_rows.is_empty() {
+        let recovery_rows = Json(serde_json::to_value(recovery_rows).map_err(|error| {
+            Status::internal(format!("serialize recovery observations: {error}"))
+        })?);
+        sqlx::query(sql!(
+            "WITH input AS (
+             SELECT *
+             FROM jsonb_to_recordset($2::jsonb) AS input(
+                 sandbox_id UUID,
+                 quarantine_recovery_payload JSONB,
+                 quarantine_recovery_observation_degraded BOOLEAN
+             )
+         ),
+         publishable AS (
+             SELECT input.*
+             FROM input
+             WHERE NOT COALESCE(input.quarantine_recovery_observation_degraded, FALSE)
+               AND input.quarantine_recovery_payload IS NOT NULL
+         )
+         INSERT INTO node_facet_observed_status (
+             node_id, facet, element, observed_payload, observed_at, updated_at
+         )
+         SELECT
+             $1,
+             $3,
+             publishable.sandbox_id::TEXT,
+             jsonb_build_object(
+                 'quarantine_recovery',
+                 publishable.quarantine_recovery_payload
+             ),
+             NOW(),
+             NOW()
+         FROM publishable
+         ON CONFLICT (node_id, facet, element) DO UPDATE
+         SET observed_payload =
+                 COALESCE(node_facet_observed_status.observed_payload, '{}'::JSONB)
+                 || EXCLUDED.observed_payload,
+             observed_at = EXCLUDED.observed_at,
+             updated_at = NOW()
+         WHERE node_facet_observed_status.observed_payload -> 'quarantine_recovery'
+               IS DISTINCT FROM EXCLUDED.observed_payload -> 'quarantine_recovery'
+            OR node_facet_observed_status.observed_at
+               < NOW() - make_interval(secs => $4::BIGINT)"
+        ))
+        .bind(node_id)
+        .bind(recovery_rows)
+        .bind(FACET_SANDBOX_DESIRED_STATE)
+        .bind(QUARANTINE_RECOVERY_OBSERVATION_HEARTBEAT_SECS)
+        .execute(&mut *conn)
+        .await
+        .map_err(|err| {
+            Status::internal(format!(
+                "write published quarantine recovery observation: {err}"
+            ))
+        })?;
+    }
+    let clear_recovery_rows = rows
+        .iter()
+        .filter(|row| {
+            !row.quarantine_recovery_observation_degraded && !row.has_recovery_observation()
+        })
+        .map(PublishedSandboxRow::recovery_observation_projection)
+        .collect::<Vec<_>>();
+    if !clear_recovery_rows.is_empty() {
+        let clear_recovery_rows =
+            Json(serde_json::to_value(clear_recovery_rows).map_err(|error| {
+                Status::internal(format!(
+                    "serialize recovery observation withdrawals: {error}"
+                ))
+            })?);
+        sqlx::query(sql!(
+            "WITH input AS (
+             SELECT *
+             FROM jsonb_to_recordset($2::jsonb) AS input(
+                 sandbox_id UUID,
+                 quarantine_recovery_payload JSONB,
+                 quarantine_recovery_observation_degraded BOOLEAN
+             )
+         ),
+         clearable AS (
+             SELECT input.sandbox_id
+             FROM input
+             WHERE NOT COALESCE(input.quarantine_recovery_observation_degraded, FALSE)
+               AND input.quarantine_recovery_payload IS NULL
+         )
+         UPDATE node_facet_observed_status observed
+         SET observed_payload = COALESCE(observed.observed_payload, '{}'::JSONB)
+                                    - 'quarantine_recovery',
+             observed_at = NOW(),
+             updated_at = NOW()
+         FROM clearable
+         WHERE observed.node_id = $1
+           AND observed.facet = $3
+           AND observed.element = clearable.sandbox_id::TEXT
+           AND observed.observed_payload ? 'quarantine_recovery'"
+        ))
+        .bind(node_id)
+        .bind(clear_recovery_rows)
+        .bind(FACET_SANDBOX_DESIRED_STATE)
+        .execute(&mut *conn)
+        .await
+        .map_err(|err| {
+            Status::internal(format!(
+                "clear published quarantine recovery observation: {err}"
+            ))
+        })?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]

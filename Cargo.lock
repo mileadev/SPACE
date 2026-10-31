@@ -5852,6 +5852,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "pplx-space-execution-catalog"
+version = "0.8.0"
+dependencies = [
+ "pplx-space-common-core",
+ "pplx-space-execution-common",
+ "semver",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "tempfile",
+ "thiserror 2.0.20",
+ "tracing",
+]
+
+[[package]]
 name = "pplx-space-execution-common"
 version = "0.8.0"
 dependencies = [
@@ -6003,6 +6018,7 @@ dependencies = [
  "pplx-space-node-mgr-client",
  "pplx-space-placement",
  "pplx-space-public-api",
+ "pplx-space-runtime-environment-catalog-store",
  "pplx-space-runtime-environment-policy-store",
  "pplx-space-sandbox-portability",
  "pplx-space-sandbox-store",
@@ -6584,6 +6600,7 @@ dependencies = [
  "pplx-space-node-mgr-client",
  "serde_json",
  "tokio",
+ "tokio-stream",
  "tonic",
 ]
 
@@ -6650,7 +6667,9 @@ dependencies = [
  "pplx-space-common-grpc",
  "pplx-space-common-io",
  "pplx-space-common-proto-build",
+ "pplx-space-execution-catalog",
  "pplx-space-execution-common",
+ "pplx-space-metrics",
  "pplx-space-net-common",
  "pplx-space-test-env",
  "prost",
@@ -6890,6 +6909,18 @@ name = "pplx-space-rpc-contracts"
 version = "0.8.0"
 dependencies = [
  "thiserror 2.0.20",
+]
+
+[[package]]
+name = "pplx-space-runtime-environment-catalog-store"
+version = "0.8.0"
+dependencies = [
+ "pplx-space-common-core",
+ "pplx-space-db-test-fixtures",
+ "pplx-space-test-env",
+ "sqlx",
+ "thiserror 2.0.20",
+ "tokio",
 ]
 
 [[package]]
@@ -7563,6 +7594,7 @@ dependencies = [
  "clap",
  "pplx-space-common-cli",
  "pplx-space-common-core",
+ "pplx-space-net-common",
  "pplx-space-sbx-mgr-client",
  "tokio",
 ]
@@ -7605,6 +7637,7 @@ dependencies = [
  "pplx-space-common-lru-reaper",
  "pplx-space-common-svc",
  "pplx-space-db-test-fixtures",
+ "pplx-space-execution-catalog",
  "pplx-space-execution-common",
  "pplx-space-feature-flags",
  "pplx-space-internal-api-server",
